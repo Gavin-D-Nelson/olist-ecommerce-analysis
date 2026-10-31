@@ -1,0 +1,13 @@
+# Raw data (link to Kaggle in README instead)
+data/
+*.csv
+
+# Mac system files
+.DS_Store
+
+# Tableau files (dashboard lives on Tableau Public)
+*.twbx
+*.hyper
+
+# Credentials
+.env
