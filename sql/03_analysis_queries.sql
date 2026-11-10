@@ -520,3 +520,239 @@ SELECT
 FROM seller_delivery
 ORDER BY late_rank, seller_id
 LIMIT 15;
+
+-- =====================================================================
+-- Shared base for Q10: revenue per seller, ranked.
+-- Population: delivered orders, Jan 2017 - Aug 2018.
+-- Revenue: SUM(price) of the seller's items (freight excluded).
+-- =====================================================================
+CREATE OR REPLACE TEMP VIEW seller_revenue AS
+WITH per_seller AS (
+    SELECT
+        oi.seller_id,
+        SUM(oi.price)::numeric                          AS revenue,
+        COUNT(DISTINCT oi.order_id)                     AS orders,
+        COUNT(*)                                        AS items_sold
+    FROM order_items AS oi
+    JOIN orders AS o
+        ON o.order_id = oi.order_id
+    WHERE o.order_status = 'delivered'
+      AND o.order_purchase_timestamp >= '2017-01-01'
+      AND o.order_purchase_timestamp <  '2018-09-01'
+    GROUP BY oi.seller_id
+)
+SELECT
+    p.seller_id,
+    s.seller_state,
+    p.revenue,
+    p.orders,
+    p.items_sold,
+    RANK() OVER (ORDER BY p.revenue DESC)               AS revenue_rank,
+    NTILE(10) OVER (ORDER BY p.revenue DESC)            AS revenue_decile,
+    100.0 * p.revenue / SUM(p.revenue) OVER ()          AS pct_of_revenue,
+    100.0 * SUM(p.revenue) OVER (
+                ORDER BY p.revenue DESC, p.seller_id
+                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+          / SUM(p.revenue) OVER ()                      AS cumulative_pct
+FROM per_seller AS p
+JOIN sellers AS s
+    ON s.seller_id = p.seller_id;
+
+-- =====================================================================
+-- Q10a. Who are the top 10 sellers by revenue?
+-- =====================================================================
+SELECT
+    revenue_rank,
+    seller_id,
+    seller_state,
+    ROUND(revenue, 2)                                   AS revenue,
+    orders,
+    ROUND(revenue / orders, 2)                          AS revenue_per_order,
+    ROUND(pct_of_revenue, 2)                            AS pct_of_revenue,
+    ROUND(cumulative_pct, 2)                            AS cumulative_pct
+FROM seller_revenue
+WHERE revenue_rank <= 10
+ORDER BY revenue_rank;
+
+-- =====================================================================
+-- Q10b. How concentrated is revenue among sellers?
+-- top_10pct_sellers: NTILE(10) splits sellers into 10 equal-sized
+-- groups by revenue; decile 1 is the top 10% of sellers.
+-- sellers_for_80pct: how many sellers it takes to reach 80% of revenue.
+-- =====================================================================
+SELECT
+    COUNT(*)                                            AS sellers,
+    ROUND(SUM(revenue), 2)                              AS total_revenue,
+    ROUND(SUM(pct_of_revenue) FILTER (WHERE revenue_rank <= 10), 2)
+                                                        AS top_10_sellers_pct,
+    ROUND(SUM(pct_of_revenue) FILTER (WHERE revenue_decile = 1), 2)
+                                                        AS top_10pct_sellers_pct,
+    COUNT(*) FILTER (WHERE cumulative_pct - pct_of_revenue < 80)
+                                                        AS sellers_for_80pct,
+    ROUND(100.0 * COUNT(*) FILTER (WHERE cumulative_pct - pct_of_revenue < 80)
+          / COUNT(*), 1)                                AS sellers_for_80pct_share,
+    ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY revenue)::numeric, 2)
+                                                        AS median_seller_revenue
+FROM seller_revenue;
+
+-- =====================================================================
+-- Q11a. What payment methods do customers use?
+-- Population: delivered orders, Jan 2017 - Aug 2018. The 1 delivered
+-- order with no payment record is simply absent (Day 1 decision 10).
+-- One order can use more than one method (e.g. voucher + card), so
+-- pct_of_orders adds up to more than 100%.
+-- Payment values include freight, so they don't match item revenue.
+-- "not_defined" is shown as "Unknown" (Day 1 decision 8).
+-- =====================================================================
+WITH payments AS (
+    SELECT
+        p.order_id,
+        CASE p.payment_type
+            WHEN 'not_defined' THEN 'Unknown'
+            ELSE p.payment_type
+        END                                             AS payment_type,
+        p.payment_value
+    FROM order_payments AS p
+    JOIN orders AS o
+        ON o.order_id = p.order_id
+    WHERE o.order_status = 'delivered'
+      AND o.order_purchase_timestamp >= '2017-01-01'
+      AND o.order_purchase_timestamp <  '2018-09-01'
+)
+SELECT
+    payment_type,
+    COUNT(DISTINCT order_id)                            AS orders_using,
+    ROUND(100.0 * COUNT(DISTINCT order_id)
+          / (SELECT COUNT(DISTINCT order_id) FROM payments), 2)
+                                                        AS pct_of_orders,
+    ROUND(SUM(payment_value)::numeric, 2)               AS payment_value,
+    ROUND(100.0 * SUM(payment_value)::numeric
+          / SUM(SUM(payment_value)::numeric) OVER (), 2)
+                                                        AS pct_of_value,
+    ROUND(AVG(payment_value)::numeric, 2)               AS avg_payment
+FROM payments
+GROUP BY payment_type
+ORDER BY orders_using DESC;
+
+-- =====================================================================
+-- Shared base for Q11b/Q11c: one row per order paid by credit card.
+-- Installments only exist for credit cards.
+-- order_value = total paid for the order across all methods.
+-- =====================================================================
+CREATE OR REPLACE TEMP VIEW card_orders AS
+SELECT
+    p.order_id,
+    MAX(p.payment_installments) FILTER (WHERE p.payment_type = 'credit_card')
+                                                        AS installments,
+    SUM(p.payment_value)::numeric                       AS order_value
+FROM order_payments AS p
+JOIN orders AS o
+    ON o.order_id = p.order_id
+WHERE o.order_status = 'delivered'
+  AND o.order_purchase_timestamp >= '2017-01-01'
+  AND o.order_purchase_timestamp <  '2018-09-01'
+GROUP BY p.order_id
+HAVING COUNT(*) FILTER (WHERE p.payment_type = 'credit_card') > 0;
+
+-- =====================================================================
+-- Q11b. How do installments relate to order value?
+-- =====================================================================
+WITH bucketed AS (
+    SELECT
+        order_value,
+        CASE
+            WHEN installments <= 1  THEN 1
+            WHEN installments <= 3  THEN 2
+            WHEN installments <= 6  THEN 3
+            WHEN installments <= 9  THEN 4
+            ELSE 5
+        END                                             AS bucket_order,
+        CASE
+            WHEN installments <= 1  THEN '1 (paid in full)'
+            WHEN installments <= 3  THEN '2-3'
+            WHEN installments <= 6  THEN '4-6'
+            WHEN installments <= 9  THEN '7-9'
+            ELSE '10+'
+        END                                             AS installment_bucket
+    FROM card_orders
+)
+SELECT
+    installment_bucket,
+    COUNT(*)                                            AS orders,
+    ROUND(100.0 * COUNT(*) / SUM(COUNT(*)) OVER (), 2)  AS pct_of_card_orders,
+    ROUND(AVG(order_value), 2)                          AS avg_order_value,
+    ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY order_value)::numeric, 2)
+                                                        AS median_order_value
+FROM bucketed
+GROUP BY bucket_order, installment_bucket
+ORDER BY bucket_order;
+
+-- =====================================================================
+-- Q11c. Summary: average installments and the correlation between
+-- installments and order value (1 = perfect positive, 0 = none).
+-- =====================================================================
+SELECT
+    COUNT(*)                                            AS card_orders,
+    ROUND(AVG(installments), 2)                         AS avg_installments,
+    ROUND(100.0 * COUNT(*) FILTER (WHERE installments > 1)
+          / COUNT(*), 2)                                AS pct_using_installments,
+    ROUND(CORR(installments, order_value)::numeric, 3)  AS corr_installments_value
+FROM card_orders;
+
+-- =====================================================================
+-- Q12. Which categories have the lowest average review scores?
+-- Uses the delivery_orders view (one review score per order, already
+-- averaged; 8 orders without a delivery date are not in it).
+-- An order with items in 2 categories counts once for each category.
+-- Only categories with at least 100 reviewed orders, so small ones
+-- don't dominate. late_pct shows whether delivery explains the score.
+-- =====================================================================
+WITH order_categories AS (
+    -- One row per (order, category)
+    SELECT DISTINCT
+        oi.order_id,
+        COALESCE(
+            t.product_category_name_english,
+            CASE p.product_category_name
+                WHEN 'portateis_cozinha_e_preparadores_de_alimentos'
+                    THEN 'portable_kitchen_food_preparers'
+                WHEN 'pc_gamer'
+                    THEN 'pc_gamer'
+            END,
+            'uncategorized'
+        )                                               AS category
+    FROM order_items AS oi
+    JOIN products AS p
+        ON p.product_id = oi.product_id
+    LEFT JOIN category_translation AS t
+        ON t.product_category_name = p.product_category_name
+),
+category_reviews AS (
+    SELECT
+        oc.category,
+        COUNT(*)                                        AS reviewed_orders,
+        AVG(d.review_score)                             AS avg_review,
+        100.0 * COUNT(*) FILTER (WHERE d.review_score <= 2)
+              / COUNT(*)                                AS low_score_pct,
+        100.0 * COUNT(*) FILTER (WHERE d.is_late)
+              / COUNT(*)                                AS late_pct
+    FROM order_categories AS oc
+    JOIN delivery_orders AS d
+        ON d.order_id = oc.order_id
+    WHERE d.review_score IS NOT NULL
+    GROUP BY oc.category
+    HAVING COUNT(*) >= 100
+)
+SELECT
+    RANK() OVER (ORDER BY avg_review)                   AS lowest_rank,
+    COUNT(*) OVER ()                                    AS qualifying_categories,
+    category,
+    reviewed_orders,
+    ROUND(avg_review, 2)                                AS avg_review_score,
+    ROUND(avg_review - (SELECT AVG(review_score) FROM delivery_orders), 2)
+                                                        AS diff_vs_overall,
+    ROUND(low_score_pct, 1)                             AS low_score_pct,
+    ROUND(late_pct, 1)                                  AS late_pct
+FROM category_reviews
+ORDER BY lowest_rank, category
+LIMIT 15;
