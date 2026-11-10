@@ -117,3 +117,184 @@ SELECT
           / SUM(revenue) OVER (), 2)                     AS cumulative_pct
 FROM category_sales
 ORDER BY revenue_rank, category;
+
+-- =====================================================================
+-- Shared base for Q4 and Q5: one row per real customer.
+--
+-- Uses customer_unique_id (Day 1 decision 9). customer_id is new on
+-- every order, so with it every customer would look like a one-time
+-- buyer.
+-- Population: delivered orders, Jan 2017 - Aug 2018.
+-- A "return" = an order on a LATER calendar day than the first order.
+-- Extra orders placed the same day as the first are part of the
+-- first visit, not a return.
+--
+-- TEMP VIEW: saves this logic once so the next three queries can reuse
+-- it. It disappears when psql finishes, so nothing is added to the
+-- database.
+-- =====================================================================
+CREATE OR REPLACE TEMP VIEW customer_summary AS
+WITH customer_orders AS (
+    SELECT
+        c.customer_unique_id,
+        o.order_purchase_timestamp,
+        MIN(o.order_purchase_timestamp)
+            OVER (PARTITION BY c.customer_unique_id)   AS first_order_at
+    FROM orders AS o
+    JOIN customers AS c
+        ON c.customer_id = o.customer_id
+    WHERE o.order_status = 'delivered'
+      AND o.order_purchase_timestamp >= '2017-01-01'
+      AND o.order_purchase_timestamp <  '2018-09-01'
+),
+per_customer AS (
+    SELECT
+        customer_unique_id,
+        first_order_at,
+        COUNT(*)                                        AS order_count,
+        MIN(order_purchase_timestamp) FILTER (
+            WHERE order_purchase_timestamp::date > first_order_at::date
+        )                                               AS return_order_at
+    FROM customer_orders
+    GROUP BY customer_unique_id, first_order_at
+)
+SELECT
+    customer_unique_id,
+    first_order_at,
+    order_count,
+    return_order_at,
+    return_order_at::date - first_order_at::date        AS return_gap_days
+FROM per_customer;
+
+-- =====================================================================
+-- Q4. What percentage of customers make a repeat purchase?
+--
+-- Two rates:
+--   repeat_rate_pct: all customers. Understates repeat buying, because
+--     customers who first bought in mid-2018 had little time to return.
+--   repeat_rate_180d_pct: only customers who first bought at least
+--     180 days before the data ends (before 2018-03-05). Each had a
+--     full 180 days to come back, so the comparison is fair.
+-- =====================================================================
+WITH flags AS (
+    SELECT
+        order_count >= 2                                AS multi_order,
+        return_order_at IS NOT NULL                     AS returned,
+        first_order_at < DATE '2018-09-01' - 180        AS full_180d_followup,
+        return_order_at < first_order_at + INTERVAL '180 days'
+                                                        AS returned_within_180d
+    FROM customer_summary
+)
+SELECT
+    COUNT(*)                                            AS customers,
+    COUNT(*) FILTER (WHERE multi_order)                 AS multi_order_customers,
+    COUNT(*) FILTER (WHERE returned)                    AS returning_customers,
+    ROUND(100.0 * COUNT(*) FILTER (WHERE returned)
+          / COUNT(*), 2)                                AS repeat_rate_pct,
+    COUNT(*) FILTER (WHERE full_180d_followup)          AS cohort_180d_customers,
+    COUNT(*) FILTER (WHERE full_180d_followup
+                       AND returned_within_180d)        AS cohort_returned_180d,
+    ROUND(100.0 * COUNT(*) FILTER (WHERE full_180d_followup
+                                     AND returned_within_180d)
+          / NULLIF(COUNT(*) FILTER (WHERE full_180d_followup), 0), 2)
+                                                        AS repeat_rate_180d_pct
+FROM flags;
+
+-- =====================================================================
+-- Q5a. How long is the typical gap between first and second orders?
+-- Summary statistics for customers who returned. The median is the
+-- headline number because a few very long gaps pull the average up.
+-- =====================================================================
+SELECT
+    COUNT(*)                                            AS returning_customers,
+    ROUND(AVG(return_gap_days), 1)                      AS avg_gap_days,
+    ROUND(PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY return_gap_days)::numeric, 1)
+                                                        AS p25_gap_days,
+    ROUND(PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY return_gap_days)::numeric, 1)
+                                                        AS median_gap_days,
+    ROUND(PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY return_gap_days)::numeric, 1)
+                                                        AS p75_gap_days,
+    MAX(return_gap_days)                                AS max_gap_days
+FROM customer_summary
+WHERE return_order_at IS NOT NULL;
+
+-- =====================================================================
+-- Q5b. Distribution of the first-to-second-order gap, in buckets.
+-- =====================================================================
+WITH bucketed AS (
+    SELECT
+        CASE
+            WHEN return_gap_days <= 7   THEN 1
+            WHEN return_gap_days <= 30  THEN 2
+            WHEN return_gap_days <= 90  THEN 3
+            WHEN return_gap_days <= 180 THEN 4
+            ELSE 5
+        END                                             AS bucket_order,
+        CASE
+            WHEN return_gap_days <= 7   THEN '1-7 days'
+            WHEN return_gap_days <= 30  THEN '8-30 days'
+            WHEN return_gap_days <= 90  THEN '31-90 days'
+            WHEN return_gap_days <= 180 THEN '91-180 days'
+            ELSE '181+ days'
+        END                                             AS gap_bucket
+    FROM customer_summary
+    WHERE return_order_at IS NOT NULL
+)
+SELECT
+    gap_bucket,
+    COUNT(*)                                            AS customers,
+    ROUND(100.0 * COUNT(*) / SUM(COUNT(*)) OVER (), 1)  AS pct,
+    ROUND(100.0 * SUM(COUNT(*)) OVER (ORDER BY bucket_order)
+          / SUM(COUNT(*)) OVER (), 1)                   AS cumulative_pct
+FROM bucketed
+GROUP BY bucket_order, gap_bucket
+ORDER BY bucket_order;
+
+-- =====================================================================
+-- Q6. Which states have the most customers and the highest revenue?
+--
+-- Population: delivered orders, Jan 2017 - Aug 2018 (same as Q1-Q5)
+-- State:      the customer's state (customers.customer_state)
+-- Revenue:    SUM(price). Freight is shown in its own columns
+--             (Day 1 decision 2): shipping cost varies a lot by region.
+-- =====================================================================
+WITH order_totals AS (
+    -- One row per order: collapse items first to avoid join fan-out
+    SELECT
+        order_id,
+        SUM(price)::numeric          AS order_revenue,
+        SUM(freight_value)::numeric  AS order_freight
+    FROM order_items
+    GROUP BY order_id
+),
+state_stats AS (
+    SELECT
+        c.customer_state                         AS state,
+        COUNT(DISTINCT c.customer_unique_id)     AS customers,
+        COUNT(*)                                 AS orders,
+        SUM(t.order_revenue)                     AS revenue,
+        SUM(t.order_freight)                     AS freight
+    FROM orders AS o
+    JOIN order_totals AS t
+        ON t.order_id = o.order_id
+    JOIN customers AS c
+        ON c.customer_id = o.customer_id
+    WHERE o.order_status = 'delivered'
+      AND o.order_purchase_timestamp >= '2017-01-01'
+      AND o.order_purchase_timestamp <  '2018-09-01'
+    GROUP BY c.customer_state
+)
+SELECT
+    RANK() OVER (ORDER BY revenue DESC)                     AS revenue_rank,
+    state,
+    customers,
+    ROUND(100.0 * customers / SUM(customers) OVER (), 2)    AS pct_of_customers,
+    orders,
+    ROUND(revenue, 2)                                       AS revenue,
+    ROUND(100.0 * revenue / SUM(revenue) OVER (), 2)        AS pct_of_revenue,
+    ROUND(revenue / orders, 2)                              AS aov,
+    ROUND(revenue / customers, 2)                           AS revenue_per_customer,
+    ROUND(freight / orders, 2)                              AS avg_freight_per_order,
+    ROUND(100.0 * freight / revenue, 1)                     AS freight_pct_of_revenue
+FROM state_stats
+ORDER BY revenue_rank, state;
