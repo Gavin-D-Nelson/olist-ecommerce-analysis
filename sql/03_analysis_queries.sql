@@ -298,3 +298,225 @@ SELECT
     ROUND(100.0 * freight / revenue, 1)                     AS freight_pct_of_revenue
 FROM state_stats
 ORDER BY revenue_rank, state;
+
+-- =====================================================================
+-- Shared base for Q7-Q9: one row per delivered order with a delivery
+-- date (Day 1 decision 4), Jan 2017 - Aug 2018.
+--
+-- Late = delivered on a LATER CALENDAR DAY than the estimated date.
+-- The estimated date is stored at midnight (00:00), so comparing full
+-- timestamps would mark an order delivered at 3pm on its promised day
+-- as late. Casting both sides to ::date compares days, not times.
+--
+-- Reviews are averaged to one score per order BEFORE joining (Day 1
+-- decision 6). LEFT JOIN keeps orders that have no review.
+-- Timeline anomalies (decision 5) are kept, as documented on Day 1.
+-- =====================================================================
+CREATE OR REPLACE TEMP VIEW delivery_orders AS
+WITH order_review AS (
+    SELECT
+        order_id,
+        AVG(review_score)::numeric                      AS review_score
+    FROM order_reviews
+    GROUP BY order_id
+)
+SELECT
+    o.order_id,
+    c.customer_state,
+    o.order_purchase_timestamp,
+    o.order_delivered_carrier_date,
+    o.order_delivered_customer_date,
+    o.order_estimated_delivery_date,
+    o.order_delivered_customer_date::date
+        - o.order_estimated_delivery_date::date         AS days_vs_estimate,
+    o.order_delivered_customer_date::date
+        > o.order_estimated_delivery_date::date         AS is_late,
+    o.order_delivered_customer_date::date
+        - o.order_purchase_timestamp::date              AS delivery_days,
+    r.review_score
+FROM orders AS o
+JOIN customers AS c
+    ON c.customer_id = o.customer_id
+LEFT JOIN order_review AS r
+    ON r.order_id = o.order_id
+WHERE o.order_status = 'delivered'
+  AND o.order_delivered_customer_date IS NOT NULL
+  AND o.order_purchase_timestamp >= '2017-01-01'
+  AND o.order_purchase_timestamp <  '2018-09-01';
+
+-- =====================================================================
+-- Q7a. What percentage of orders arrive on time vs. late compared to
+--      the estimated delivery date?
+-- late_pct_timestamp_method shows how much the timestamp trap would
+-- overstate lateness. It is here for comparison only.
+-- =====================================================================
+SELECT
+    COUNT(*)                                            AS orders,
+    COUNT(*) FILTER (WHERE NOT is_late)                 AS on_time_orders,
+    COUNT(*) FILTER (WHERE is_late)                     AS late_orders,
+    ROUND(100.0 * COUNT(*) FILTER (WHERE NOT is_late)
+          / COUNT(*), 2)                                AS on_time_pct,
+    ROUND(100.0 * COUNT(*) FILTER (WHERE is_late)
+          / COUNT(*), 2)                                AS late_pct,
+    ROUND(100.0 * COUNT(*) FILTER (
+              WHERE order_delivered_customer_date > order_estimated_delivery_date)
+          / COUNT(*), 2)                                AS late_pct_timestamp_method,
+    ROUND(AVG(delivery_days), 1)                        AS avg_delivery_days,
+    ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY delivery_days)::numeric, 1)
+                                                        AS median_delivery_days,
+    ROUND(AVG(-days_vs_estimate) FILTER (WHERE NOT is_late), 1)
+                                                        AS avg_days_early_if_on_time,
+    ROUND(AVG(days_vs_estimate) FILTER (WHERE is_late), 1)
+                                                        AS avg_days_late_if_late
+FROM delivery_orders;
+
+-- =====================================================================
+-- Q7b. Late % and delivery time by purchase month.
+-- Shows whether delivery got worse in busy months (e.g. Nov 2017).
+-- =====================================================================
+SELECT
+    DATE_TRUNC('month', order_purchase_timestamp)::date AS order_month,
+    COUNT(*)                                            AS orders,
+    ROUND(100.0 * COUNT(*) FILTER (WHERE is_late)
+          / COUNT(*), 2)                                AS late_pct,
+    ROUND(AVG(delivery_days), 1)                        AS avg_delivery_days
+FROM delivery_orders
+GROUP BY 1
+ORDER BY 1;
+
+-- =====================================================================
+-- Q8a. Does late delivery lower review scores, and by how much?
+-- low_score_pct = share of reviewed orders scoring 2 or below.
+-- =====================================================================
+SELECT
+    CASE WHEN is_late THEN 'Late' ELSE 'On time' END    AS delivery_status,
+    COUNT(*)                                            AS orders,
+    COUNT(review_score)                                 AS reviewed_orders,
+    ROUND(AVG(review_score), 2)                         AS avg_review_score,
+    ROUND(100.0 * COUNT(*) FILTER (WHERE review_score <= 2)
+          / COUNT(review_score), 1)                     AS low_score_pct
+FROM delivery_orders
+GROUP BY is_late
+ORDER BY is_late;
+
+-- =====================================================================
+-- Q8b. Review score by how late the order was.
+-- diff_vs_on_time = this bucket's average minus the on-time average.
+-- =====================================================================
+WITH bucketed AS (
+    SELECT
+        review_score,
+        CASE
+            WHEN days_vs_estimate <= 0  THEN 1
+            WHEN days_vs_estimate <= 3  THEN 2
+            WHEN days_vs_estimate <= 7  THEN 3
+            WHEN days_vs_estimate <= 14 THEN 4
+            ELSE 5
+        END                                             AS bucket_order,
+        CASE
+            WHEN days_vs_estimate <= 0  THEN 'On time or early'
+            WHEN days_vs_estimate <= 3  THEN '1-3 days late'
+            WHEN days_vs_estimate <= 7  THEN '4-7 days late'
+            WHEN days_vs_estimate <= 14 THEN '8-14 days late'
+            ELSE '15+ days late'
+        END                                             AS delay_bucket
+    FROM delivery_orders
+)
+SELECT
+    delay_bucket,
+    COUNT(*)                                            AS orders,
+    ROUND(100.0 * COUNT(*) / SUM(COUNT(*)) OVER (), 2)  AS pct_of_orders,
+    COUNT(review_score)                                 AS reviewed_orders,
+    ROUND(AVG(review_score), 2)                         AS avg_review_score,
+    ROUND(AVG(review_score)
+          - FIRST_VALUE(AVG(review_score)) OVER (ORDER BY bucket_order), 2)
+                                                        AS diff_vs_on_time,
+    ROUND(100.0 * COUNT(*) FILTER (WHERE review_score <= 2)
+          / NULLIF(COUNT(review_score), 0), 1)          AS low_score_pct
+FROM bucketed
+GROUP BY bucket_order, delay_bucket
+ORDER BY bucket_order;
+
+-- =====================================================================
+-- Q9a. Which states have the worst delivery performance?
+-- State = customer's state (where the package was delivered).
+-- avg_days_vs_estimate: negative = arrived that many days early.
+-- =====================================================================
+WITH state_delivery AS (
+    SELECT
+        customer_state                                  AS state,
+        COUNT(*)                                        AS orders,
+        ROUND(100.0 * COUNT(*) FILTER (WHERE is_late)
+              / COUNT(*), 2)                            AS late_pct,
+        ROUND(AVG(delivery_days), 1)                    AS avg_delivery_days,
+        ROUND(AVG(days_vs_estimate), 1)                 AS avg_days_vs_estimate,
+        ROUND(AVG(review_score), 2)                     AS avg_review_score
+    FROM delivery_orders
+    GROUP BY customer_state
+)
+SELECT
+    RANK() OVER (ORDER BY late_pct DESC)                AS late_rank,
+    state,
+    orders,
+    late_pct,
+    avg_delivery_days,
+    avg_days_vs_estimate,
+    avg_review_score
+FROM state_delivery
+ORDER BY late_rank, state;
+
+-- =====================================================================
+-- Q9b. Which sellers have the worst delivery performance?
+-- Sellers with at least 50 delivered orders only, so tiny samples
+-- (e.g. 1 late out of 2) don't top the list. Top 15 by late %.
+--
+-- late_pct:         customer got the order after the estimated date.
+--                   An order with 2 sellers counts for both.
+-- late_handoff_pct: the seller gave the order to the carrier after its
+--                   shipping_limit_date. This is the part of lateness
+--                   that is clearly the seller's fault.
+-- =====================================================================
+WITH seller_orders AS (
+    -- One row per (seller, order): one order can include several sellers
+    SELECT
+        seller_id,
+        order_id,
+        MAX(shipping_limit_date)                        AS shipping_limit_date
+    FROM order_items
+    GROUP BY seller_id, order_id
+),
+seller_delivery AS (
+    SELECT
+        so.seller_id,
+        s.seller_state,
+        COUNT(*)                                        AS orders,
+        COUNT(*) FILTER (WHERE d.is_late)               AS late_orders,
+        ROUND(100.0 * COUNT(*) FILTER (WHERE d.is_late)
+              / COUNT(*), 1)                            AS late_pct,
+        ROUND(100.0 * COUNT(*) FILTER (
+                  WHERE d.order_delivered_carrier_date > so.shipping_limit_date)
+              / COUNT(*), 1)                            AS late_handoff_pct,
+        ROUND(AVG(d.delivery_days), 1)                  AS avg_delivery_days,
+        ROUND(AVG(d.review_score), 2)                   AS avg_review_score
+    FROM seller_orders AS so
+    JOIN delivery_orders AS d
+        ON d.order_id = so.order_id
+    JOIN sellers AS s
+        ON s.seller_id = so.seller_id
+    GROUP BY so.seller_id, s.seller_state
+    HAVING COUNT(*) >= 50
+)
+SELECT
+    RANK() OVER (ORDER BY late_pct DESC)                AS late_rank,
+    COUNT(*) OVER ()                                    AS qualifying_sellers,
+    seller_id,
+    seller_state,
+    orders,
+    late_orders,
+    late_pct,
+    late_handoff_pct,
+    avg_delivery_days,
+    avg_review_score
+FROM seller_delivery
+ORDER BY late_rank, seller_id
+LIMIT 15;
