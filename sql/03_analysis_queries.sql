@@ -756,3 +756,61 @@ SELECT
 FROM category_reviews
 ORDER BY lowest_rank, category
 LIMIT 15;
+
+-- =====================================================================
+-- KPI SUMMARY for the dashboard cards (one row, five KPIs).
+--
+-- Population: delivered orders, Jan 2017 - Aug 2018, the same as
+-- Q1-Q12, so every card reconciles to the analysis results.
+--   total_revenue     SUM(order_items.price), freight excluded
+--   total_orders      delivered orders in the window
+--   aov               total_revenue / total_orders
+--   on_time_pct       delivered on or before the estimated DATE, out of
+--                     orders that have a delivery date
+--   avg_review_score  average of per-order scores (each order's reviews
+--                     averaged first), out of orders with a review
+-- Self-contained (no temp views) so it can be reused in the export
+-- script on its own.
+-- =====================================================================
+WITH window_orders AS (
+    SELECT
+        order_id,
+        order_delivered_customer_date,
+        order_estimated_delivery_date
+    FROM orders
+    WHERE order_status = 'delivered'
+      AND order_purchase_timestamp >= '2017-01-01'
+      AND order_purchase_timestamp <  '2018-09-01'
+),
+order_revenue AS (
+    -- One row per order
+    SELECT
+        order_id,
+        SUM(price)::numeric                             AS revenue
+    FROM order_items
+    GROUP BY order_id
+),
+order_review AS (
+    -- One row per order
+    SELECT
+        order_id,
+        AVG(review_score)::numeric                      AS review_score
+    FROM order_reviews
+    GROUP BY order_id
+)
+SELECT
+    ROUND(SUM(rv.revenue), 2)                           AS total_revenue,
+    COUNT(*)                                            AS total_orders,
+    ROUND(SUM(rv.revenue) / COUNT(*), 2)                AS aov,
+    ROUND(100.0 * COUNT(*) FILTER (
+              WHERE w.order_delivered_customer_date::date
+                 <= w.order_estimated_delivery_date::date)
+          / COUNT(w.order_delivered_customer_date), 2)  AS on_time_pct,
+    ROUND(AVG(rw.review_score), 2)                      AS avg_review_score,
+    COUNT(w.order_delivered_customer_date)              AS orders_with_delivery_date,
+    COUNT(rw.review_score)                              AS reviewed_orders
+FROM window_orders AS w
+LEFT JOIN order_revenue AS rv
+    ON rv.order_id = w.order_id
+LEFT JOIN order_review AS rw
+    ON rw.order_id = w.order_id;
